@@ -67,7 +67,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 | Herkunft | Felder |
 |---|---|
 | **Provider (QuantData)**, unverändert, fehlend = leer/null | alle CSV-Spalten ohne Präfix; in JSON das Objekt `provider` (vollständiger Rohdatensatz inkl. `comprisingTrades`) |
-| **Reader (diese App)** | `reader_aggressor` + `reader_aggressor_confidence` (aus `tradeSideCode` über `Reader.TradeSideCodeMap`), `reader_comprising_trades` (Anzahl), `reader_endpoint`, `reader_received_utc` (Empfangszeit ≠ `tradeTime`) |
+| **Reader (diese App)** | `reader_aggressor` + `reader_aggressor_confidence` (aus `tradeSideCode` über `Reader.TradeSideCodeMap`), `reader_comprising_trades` (Anzahl), `reader_endpoint`, `reader_received_utc`/`reader_received_ms` (Empfangszeit ≠ `tradeTime`), `reader_key` (Schlüssel zur Duplikaterkennung) |
 
 `reader_aggressor` beschreibt nur die Ausführung relativ zu Bid/Ask. Das ist **nicht** Opening/Closing
 und **nicht** bullish/bearish. Ist ein Code nicht in der Zuordnung eingetragen, bleibt der Wert `UNKNOWN`.
@@ -85,6 +85,7 @@ und **nicht** bullish/bearish. Ist ein Code nicht in der Zuordnung eingetragen, 
 ## HTTP
 
 - `GET /flow?ticker=SPX&since=<tradeTime ms>&minPremium=250000` → JSON (`provider`/`reader`)
-- `GET /flow.csv?ticker=SPX&minPremium=250000` → CSV (für den DeepCharts-Indikator)
+- `GET /flow.csv?ticker=SPX&minPremium=250000&receivedSince=<ms>` → CSV (für den DeepCharts-Indikator;
+  `receivedSince` filtert nach Empfangszeit, damit nachgeladene ältere Prints nicht verloren gehen)
 - `GET /status` → Status je Ticker plus `generatedAt`
 - `GET /health` → `ok`

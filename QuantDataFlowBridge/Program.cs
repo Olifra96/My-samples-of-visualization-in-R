@@ -40,7 +40,7 @@ else
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-var store = new FlowStore(cfg.Output.JsonMaxRecords);
+var store = new FlowStore(cfg.Output.StoreMaxRecords);
 var files = new FileSink(cfg.Output);
 var poller = new FlowPoller(new OrderFlowClient(api, cfg),
     cfg, demo ? Path.Combine(cfg.Output.Directory, "checkpoints.demo.json") : files.StatePath);

@@ -110,6 +110,9 @@ public sealed class OutputConfig
     public bool WriteJson { get; set; } = true;
     public int JsonMaxRecords { get; set; } = 500;
 
+    // Wie viele Prints die Bridge im Speicher hält (Quelle für HTTP und damit für den DeepCharts-Indikator).
+    public int StoreMaxRecords { get; set; } = 20_000;
+
     // 0 = lokaler HTTP-Endpunkt deaktiviert
     public int HttpPort { get; set; } = 5005;
 }
