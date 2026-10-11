@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace QuantDataFlowBridge;
 
@@ -16,19 +17,22 @@ public sealed class FlowStore
 
     public FlowStore(int maxRecords) => _max = Math.Max(1, maxRecords);
 
-    // Gibt nur die wirklich neuen Einträge zurück (Duplikate aus wiederholtem Polling werden verworfen).
+    // Gibt nur die wirklich neuen Einträge zurück (Überlappung und Mehrfachseiten werden dedupliziert).
     public List<FlowRecord> AddNew(IEnumerable<FlowRecord> records)
     {
         var added = new List<FlowRecord>();
         lock (_lock)
         {
-            foreach (var r in records.OrderBy(r => r.Time))
+            foreach (var r in records.OrderBy(r => r.TradeTime))
             {
-                if (!_seen.Add(r.Id)) continue;
-                _seenOrder.Enqueue(r.Id);
-                if (_seenOrder.Count > 50_000) _seen.Remove(_seenOrder.Dequeue());
+                if (!_seen.Add(r.Key)) continue;
+                _seenOrder.Enqueue(r.Key);
+                if (_seenOrder.Count > 200_000) _seen.Remove(_seenOrder.Dequeue());
 
-                _items.AddLast(r);
+                // Sortiert einfügen, da Catch-up-Seiten ältere Prints nachliefern können.
+                var node = _items.Last;
+                while (node != null && node.Value.TradeTime > r.TradeTime) node = node.Previous;
+                if (node == null) _items.AddFirst(r); else _items.AddAfter(node, r);
                 if (_items.Count > _max) _items.RemoveFirst();
                 added.Add(r);
             }
@@ -40,35 +44,69 @@ public sealed class FlowStore
     {
         lock (_lock)
             return _items
-                .Where(r => ticker == null || r.Ticker.Equals(ticker, StringComparison.OrdinalIgnoreCase))
-                .Where(r => since == null || r.Time > since)
+                .Where(r => ticker == null || r.DisplayTicker.Equals(ticker, StringComparison.OrdinalIgnoreCase))
+                .Where(r => since == null || r.TradeTime > since)
                 .ToList();
     }
 }
 
 public static class FlowFormat
 {
+    // Spalten ohne Präfix = Provider-Felder (QuantData); Spalten mit "reader_" = von dieser App berechnet.
     public const string CsvHeader =
-        "time_utc,unix_ms,ticker,expiry,strike,put_call,side,size,price,premium,underlying";
+        "trade_time_utc,trade_time_ms,ticker,osi,put_call,expiration,dte,strike,premium,size,volume,open_interest," +
+        "price,underlying_price,trade_side_code,trade_type,trade_consolidation_type,sentiment,is_golden_sweep," +
+        "reader_aggressor,reader_aggressor_confidence,reader_comprising_trades,reader_endpoint,reader_received_utc";
 
     public static string ToCsv(FlowRecord r) => string.Join(',',
-        r.Time.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
-        r.Time.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture),
-        r.Ticker,
-        r.Expiry?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "",
-        r.Strike.ToString(CultureInfo.InvariantCulture),
-        r.PutCall,
-        r.Side,
-        r.Size.ToString(CultureInfo.InvariantCulture),
-        r.Price.ToString(CultureInfo.InvariantCulture),
-        r.Premium.ToString("0.##", CultureInfo.InvariantCulture),
-        r.Underlying?.ToString(CultureInfo.InvariantCulture) ?? "");
+        r.TradeTime.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture),
+        r.TradeTime.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture),
+        Esc(r.DisplayTicker), Esc(r.Osi), Esc(r.PutCall), Esc(r.Expiration), Num(r.Dte), Num(r.Strike),
+        Num(r.Premium), Num(r.Size), Num(r.Volume), Num(r.OpenInterest), Num(r.Price), Num(r.UnderlyingPrice),
+        Esc(r.TradeSideCode), Esc(r.TradeType), Esc(r.TradeConsolidationType), Esc(r.Sentiment),
+        r.IsGoldenSweep switch { true => "true", false => "false", null => "" },
+        r.Aggressor, r.AggressorConfidence,
+        r.ComprisingTradeCount?.ToString(CultureInfo.InvariantCulture) ?? "",
+        r.Endpoint,
+        r.ReceivedAt.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture));
 
-    public static readonly JsonSerializerOptions Json = new()
+    private static string Num(decimal? d) => d?.ToString(CultureInfo.InvariantCulture) ?? "";
+
+    private static string Esc(string? s) =>
+        s == null ? "" : s.IndexOfAny([',', '"', '\n', '\r']) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
+
+    // JSON: Rohdaten des Providers unverändert unter "provider", eigene Ableitungen unter "reader".
+    public static JsonObject ToJson(FlowRecord r) => new()
     {
-        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        WriteIndented = false
+        ["provider"] = JsonNode.Parse(r.Raw.GetRawText()),
+        ["reader"] = new JsonObject
+        {
+            ["key"] = r.Key,
+            ["requestedTicker"] = r.RequestedTicker,
+            ["endpoint"] = r.Endpoint,
+            ["receivedAt"] = r.ReceivedAt.ToUnixTimeMilliseconds(),
+            ["aggressor"] = r.Aggressor,
+            ["aggressorConfidence"] = r.AggressorConfidence,
+            ["comprisingTradeCount"] = r.ComprisingTradeCount
+        }
     };
+
+    public static string ToJsonArray(IEnumerable<FlowRecord> records) =>
+        new JsonArray(records.Select(r => (JsonNode)ToJson(r)).ToArray()).ToJsonString();
+
+    public static string StatusJson(IReadOnlyList<TickerStatus> status) => new JsonObject
+    {
+        ["generatedAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        ["tickers"] = new JsonArray(status.Select(s => (JsonNode)new JsonObject
+        {
+            ["ticker"] = s.Ticker,
+            ["state"] = s.State.ToString().ToUpperInvariant(),
+            ["endpoint"] = s.Endpoint,
+            ["message"] = s.Message,
+            ["checkpoint"] = s.Checkpoint?.ToUnixTimeMilliseconds(),
+            ["updatedAt"] = s.UpdatedAt.ToUnixTimeMilliseconds()
+        }).ToArray())
+    }.ToJsonString();
 }
 
 // Schreibt pro Tag eine CSV-Datei (anhängend) und eine stets aktuelle JSON-Datei mit den letzten N Einträgen.
@@ -86,12 +124,15 @@ public sealed class FileSink
         Path.Combine(_cfg.Directory, $"flow_{utcDate:yyyyMMdd}.csv");
 
     public string JsonPath => Path.Combine(_cfg.Directory, "flow_latest.json");
+    public string StatusPath => Path.Combine(_cfg.Directory, "status.json");
+    public string StatePath => Path.Combine(_cfg.Directory, "checkpoints.json");
 
     public void Write(IReadOnlyList<FlowRecord> added, FlowStore store)
     {
         if (_cfg.WriteCsv && added.Count > 0)
         {
-            foreach (var group in added.GroupBy(r => r.Time.UtcDateTime.Date))
+            // CSV ist nach Empfang angehängt; Catch-up-Prints können älter sein als bereits geschriebene Zeilen.
+            foreach (var group in added.GroupBy(r => r.TradeTime.UtcDateTime.Date))
             {
                 var path = CsvPathFor(group.Key);
                 var sb = new StringBuilder();
@@ -102,16 +143,21 @@ public sealed class FileSink
         }
 
         if (_cfg.WriteJson && added.Count > 0)
+            WriteAtomic(JsonPath, FlowFormat.ToJsonArray(store.Snapshot()));
+    }
+
+    public void WriteStatus(IReadOnlyList<TickerStatus> status) =>
+        WriteAtomic(StatusPath, FlowFormat.StatusJson(status));
+
+    // Atomar ersetzen, damit ein Leser nie eine halb geschriebene Datei sieht.
+    private static void WriteAtomic(string path, string content)
+    {
+        var tmp = path + ".tmp";
+        WithRetry(() =>
         {
-            // Atomar ersetzen, damit ein Leser nie eine halb geschriebene Datei sieht.
-            var tmp = JsonPath + ".tmp";
-            var json = JsonSerializer.Serialize(store.Snapshot(), FlowFormat.Json);
-            WithRetry(() =>
-            {
-                File.WriteAllText(tmp, json);
-                File.Move(tmp, JsonPath, overwrite: true);
-            });
-        }
+            File.WriteAllText(tmp, content);
+            File.Move(tmp, path, overwrite: true);
+        });
     }
 
     // Unter Windows kann die Datei kurz von einem Leser (z. B. DeepCharts) gesperrt sein.
@@ -125,15 +171,18 @@ public sealed class FileSink
     }
 }
 
-// Minimaler lokaler HTTP-Server: http://localhost:{port}/flow[.csv]?ticker=SPY&since=<unix_ms>
+// Minimaler lokaler HTTP-Server (nur localhost):
+//   /flow[.csv]?ticker=NDX&since=<trade_time_ms>   /status   /health
 public sealed class HttpSink : IDisposable
 {
     private readonly HttpListener _listener = new();
     private readonly FlowStore _store;
+    private readonly Func<IReadOnlyList<TickerStatus>> _status;
 
-    public HttpSink(int port, FlowStore store)
+    public HttpSink(int port, FlowStore store, Func<IReadOnlyList<TickerStatus>> status)
     {
         _store = store;
+        _status = status;
         _listener.Prefixes.Add($"http://localhost:{port}/");
     }
 
@@ -165,19 +214,21 @@ public sealed class HttpSink : IDisposable
             switch (path)
             {
                 case "/flow":
-                    Respond(ctx, 200, "application/json",
-                        JsonSerializer.Serialize(_store.Snapshot(ticker, since), FlowFormat.Json));
+                    Respond(ctx, 200, "application/json", FlowFormat.ToJsonArray(_store.Snapshot(ticker, since)));
                     break;
                 case "/flow.csv":
                     var sb = new StringBuilder().AppendLine(FlowFormat.CsvHeader);
                     foreach (var r in _store.Snapshot(ticker, since)) sb.AppendLine(FlowFormat.ToCsv(r));
                     Respond(ctx, 200, "text/csv", sb.ToString());
                     break;
+                case "/status":
+                    Respond(ctx, 200, "application/json", FlowFormat.StatusJson(_status()));
+                    break;
                 case "" or "/health":
                     Respond(ctx, 200, "text/plain", "ok");
                     break;
                 default:
-                    Respond(ctx, 404, "text/plain", "Endpunkte: /flow, /flow.csv, /health");
+                    Respond(ctx, 404, "text/plain", "Endpunkte: /flow, /flow.csv, /status, /health");
                     break;
             }
         }

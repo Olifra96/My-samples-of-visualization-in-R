@@ -1,81 +1,90 @@
-# Quant Data Options Flow Bridge (C#)
+# QuantData Options Flow Bridge (C#)
 
-Konsolen-App für das **Windows Terminal**: holt Options-Flow-Daten über die Quant-Data-API,
-zeigt sie live und farbig im Terminal an und stellt sie gleichzeitig so bereit, dass
-**DeepCharts** (oder jedes andere Tool) sie abholen kann.
+Konsolen-App für das **Windows Terminal**: Sie fragt den Options-Flow für NDX, QQQ und SPX per REST
+bei QuantData ab, zeigt ihn farbig im Terminal an und stellt ihn als Datei bzw. lokalen
+HTTP-Endpunkt bereit, aus dem **DeepCharts** die Daten abholt.
 
 ```
-Quant Data API ──► QuantDataFlowBridge.exe (Windows Terminal)
-                     ├─ Live-Anzeige im Terminal (Calls grün, Puts rot, ≥1 Mio. $ gelb)
-                     ├─ C:\QuantDataFlow\flow_YYYYMMDD.csv    (Tagesdatei, wird fortlaufend ergänzt)
-                     ├─ C:\QuantDataFlow\flow_latest.json     (letzte N Einträge, atomar ersetzt)
-                     └─ http://localhost:5005/flow            (JSON) bzw. /flow.csv
-                                   ▲
-                                   └── DeepCharts liest Datei oder Endpunkt
+QuantData REST (POST, Bearer)
+  /v1/options/tool/order-flow/consolidated      (primär)
+  /v1/options/tool/order-flow/unconsolidated    (Fallback bei 404/503)
+        │  Polling, Pagination über nextSearchAfter → searchAfter
+        ▼
+QuantDataFlowBridge.exe (Windows Terminal)
+  ├─ Live-Anzeige + Statuszeile (OK / PARTIAL / Fallback / SPX nicht geliefert)
+  ├─ C:\QuantDataFlow\flow_YYYYMMDD.csv     flache Tabelle (Provider-Spalten + reader_*-Spalten)
+  ├─ C:\QuantDataFlow\flow_latest.json      { provider: <Rohdatensatz>, reader: {...} }
+  ├─ C:\QuantDataFlow\status.json           Status je Ticker
+  └─ http://localhost:5005/flow | /flow.csv | /status
+                     ▲
+                     └── DeepCharts
 ```
 
-> Wichtig: Ein anderes Programm kann nicht direkt aus dem *Terminal-Fenster* lesen. Das Terminal
-> dient nur zur Anzeige. DeepCharts greift auf die CSV-/JSON-Datei oder den lokalen HTTP-Endpunkt zu.
-
-## Voraussetzungen
-
-- Windows 10/11 mit [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
-- Quant-Data-API-Key
+> Ein anderes Programm kann nicht direkt aus dem *Terminal-Fenster* lesen. Das Terminal dient nur
+> zur Anzeige. DeepCharts greift auf die Dateien oder den lokalen Endpunkt zu.
 
 ## Starten
 
+Voraussetzungen: Windows 10/11, [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0),
+QuantData-API-Abo (ggf. mit unterschriebener OPRA-Vereinbarung).
+
 ```powershell
 cd QuantDataFlowBridge
+dotnet run -- --demo                 # Test mit Zufallsdaten, ohne API
 
-# 1) Erst ohne API testen (Zufallsdaten):
-dotnet run -- --demo
-
-# 2) Mit echten Daten:
-$env:QUANTDATA_API_KEY = "DEIN_KEY"          # nur für diese Sitzung
-# dauerhaft: setx QUANTDATA_API_KEY "DEIN_KEY"  (danach Terminal neu öffnen)
-dotnet run
+$env:QUANTDATA_API_KEY = "…"         # nur für diese Terminal-Sitzung
+dotnet run                           # echte Daten
 ```
 
-Als einzelne `.exe` veröffentlichen:
+Den Schlüssel nur als Umgebungsvariable setzen, nie in `appsettings.json`, Git oder Chats.
+Die App gibt ihn nicht aus und protokolliert ihn nicht.
+
+Als `.exe` veröffentlichen:
 
 ```powershell
 dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o C:\QuantDataFlow\app
-C:\QuantDataFlow\app\QuantDataFlowBridge.exe
 ```
 
-Beenden mit `Strg+C`.
+## Abruflogik
 
-## Konfiguration (`appsettings.json`)
+- **Polling**, kein Live-Stream: Abfrage alle `PollSeconds` (Standard 10 s).
+- **Catch-up:** ab dem letzten gespeicherten `tradeTime` je Ticker (`checkpoints.json`) mit
+  `OverlapSeconds` Überlappung, aufsteigend sortiert, höchstens `MaxCatchUpPages` (8) Seiten pro Zyklus.
+  Ohne Checkpoint wird höchstens `MaxLookbackHours` (24 h) zurückgeschaut. Das ist kein Import der
+  gesamten Historie.
+- **PARTIAL:** Sind nach 8 Seiten noch Daten übrig, wird der Status PARTIAL gesetzt und zusätzlich
+  die neueste Seite abgefragt, damit aktuelle Prints sofort sichtbar sind.
+- **Fallback:** Antwortet `consolidated` mit 404 oder 503, wird für `FallbackMinutes` der
+  unkonsolidierte Endpunkt verwendet (ohne `includeComprisingTrades`). Diese Zeilen sind mit `RAW` markiert.
+- **SPX** ist optional: Wird SPX nicht geliefert, erscheint ein Hinweis, und NDX und QQQ laufen weiter.
+- **429:** Die App wartet die Zeit aus `Retry-After` ab (sonst `DefaultRetryAfterSeconds`).
+  **401/403:** Die App beendet sich mit einem Hinweis auf Key, Abo bzw. OPRA.
+- **Duplikate** (durch Überlappung oder Seiten) werden über die Provider-`id` erkannt. Fehlt sie,
+  wird ein Ersatzschlüssel aus Zeit, OSI, Größe und Preis gebildet.
 
-| Bereich    | Schlüssel              | Bedeutung |
-|------------|------------------------|-----------|
-| `Api`      | `BaseUrl`, `FlowPath`  | Basis-URL und Pfad des Flow-Endpunkts laut Quant-Data-Doku |
-|            | `TickerQueryParam`     | Name des Query-Parameters für den Ticker |
-|            | `ApiKeyHeader`, `ApiKeyPrefix` | z. B. `Authorization` + `Bearer `, oder `X-API-Key` + leer |
-|            | `DataArrayProperty`    | Name des Arrays in der Antwort (`{"data":[...]}`); leer, wenn die Antwort direkt ein Array ist |
-|            | `PollSeconds`          | Abfrageintervall (Rate Limit beachten) |
-| `FieldMap` | `Time`, `Strike`, …    | JSON-Feldnamen der API-Antwort → interne Felder |
-| `Filter`   | `Tickers`, `MinPremium`| Welche Underlyings, ab welcher Prämie |
-| `Output`   | `Directory`            | Zielordner für CSV/JSON |
-|            | `HttpPort`             | Port des lokalen Endpunkts (`0` = aus) |
+## Provider-Daten vs. Reader-Ableitungen
 
-**Bevor du mit echten Daten startest:** `BaseUrl`, `FlowPath`, die Header und `FieldMap` mit der
-Quant-Data-API-Dokumentation abgleichen. Die Werte in der Datei sind Platzhalter. Zeitstempel
-werden als ISO-8601 oder Unix-Zeit (s/ms) erkannt. Fehlt `premium`, wird `price × size × 100`
-gerechnet. Fehlt eine `id`, wird aus Zeit, Strike, Typ, Größe und Preis ein Schlüssel zur
-Duplikaterkennung gebildet.
+| Herkunft | Felder |
+|---|---|
+| **Provider (QuantData)**, unverändert, fehlend = leer/null | alle CSV-Spalten ohne Präfix; in JSON das Objekt `provider` (vollständiger Rohdatensatz inkl. `comprisingTrades`) |
+| **Reader (diese App)** | `reader_aggressor` + `reader_aggressor_confidence` (aus `tradeSideCode` über `Reader.TradeSideCodeMap`), `reader_comprising_trades` (Anzahl), `reader_endpoint`, `reader_received_utc` (Empfangszeit ≠ `tradeTime`) |
 
-## Ausgabeformat
+`reader_aggressor` beschreibt nur die Ausführung relativ zu Bid/Ask. Das ist **nicht** Opening/Closing
+und **nicht** bullish/bearish. Ist ein Code nicht in der Zuordnung eingetragen, bleibt der Wert `UNKNOWN`.
 
-CSV (Komma-getrennt, Punkt als Dezimaltrennzeichen, Zeit in UTC):
+## Noch zu bestätigen (aus `app/api/flow/route.ts`, `lib/flow.ts` bzw. QuantData-Doku)
 
-```
-time_utc,unix_ms,ticker,expiry,strike,put_call,side,size,price,premium,underlying
-2026-10-09 14:31:05,1791556265000,SPY,2026-10-17,580,CALL,ASK,1200,2.15,258000,576.3
-```
+1. **`Api.RequestBodyTemplate`**: genaue Form von `timeRange`, Ticker-Filter, Sortierung und
+   Seitengröße. Die Vorlage ist eine Annahme. Platzhalter: `$ticker $fromMs $toMs $fromIso $toIso
+   $pageSize $sortDirection`.
+2. **`FieldMap`**: Bestätigt sind `tradeTime`, `tradeSideCode`, `tradeType`, `tradeConsolidationType`,
+   `isGoldenSweep`, `comprisingTrades`, `premium` und `size`. Die übrigen Feldnamen sind Annahmen.
+3. **`Reader.TradeSideCodeMap`**: die tatsächlichen `tradeSideCode`-Werte und ihre Einstufung.
+4. **DeepCharts:** welches Format bzw. welcher Pfad eingelesen wird.
 
-HTTP:
+## HTTP
 
-- `GET http://localhost:5005/flow?ticker=SPY` → JSON-Array
-- `GET http://localhost:5005/flow.csv?ticker=SPY&since=1791556265000` → nur Einträge nach diesem Zeitpunkt
-- `GET http://localhost:5005/health` → `ok`
+- `GET /flow?ticker=NDX&since=<tradeTime ms>` → JSON (`provider`/`reader`)
+- `GET /flow.csv?ticker=QQQ` → CSV
+- `GET /status` → Status je Ticker plus `generatedAt`
+- `GET /health` → `ok`
