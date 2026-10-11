@@ -1,6 +1,6 @@
 # QuantData Options Flow Bridge (C#)
 
-Konsolen-App für das **Windows Terminal**: Sie fragt den Options-Flow für NDX, QQQ und SPX per REST
+Konsolen-App für das **Windows Terminal**: Sie fragt den Options-Flow (Standard: SPX, einstellbar in `Filter.Tickers`) per REST
 bei QuantData ab, zeigt ihn farbig im Terminal an und stellt ihn als Datei bzw. lokalen
 HTTP-Endpunkt bereit, aus dem **DeepCharts** die Daten abholt.
 
@@ -56,7 +56,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
   die neueste Seite abgefragt, damit aktuelle Prints sofort sichtbar sind.
 - **Fallback:** Antwortet `consolidated` mit 404 oder 503, wird für `FallbackMinutes` der
   unkonsolidierte Endpunkt verwendet (ohne `includeComprisingTrades`). Diese Zeilen sind mit `RAW` markiert.
-- **SPX** ist optional: Wird SPX nicht geliefert, erscheint ein Hinweis, und NDX und QQQ laufen weiter.
+- **Optionale Ticker** (`Filter.OptionalTickers`): Wird ein solcher Ticker nicht geliefert, erscheint nur ein Hinweis, und die übrigen laufen weiter.
 - **429:** Die App wartet die Zeit aus `Retry-After` ab (sonst `DefaultRetryAfterSeconds`).
   **401/403:** Die App beendet sich mit einem Hinweis auf Key, Abo bzw. OPRA.
 - **Duplikate** (durch Überlappung oder Seiten) werden über die Provider-`id` erkannt. Fehlt sie,
@@ -84,7 +84,7 @@ und **nicht** bullish/bearish. Ist ein Code nicht in der Zuordnung eingetragen, 
 
 ## HTTP
 
-- `GET /flow?ticker=NDX&since=<tradeTime ms>` → JSON (`provider`/`reader`)
-- `GET /flow.csv?ticker=QQQ` → CSV
+- `GET /flow?ticker=SPX&since=<tradeTime ms>&minPremium=250000` → JSON (`provider`/`reader`)
+- `GET /flow.csv?ticker=SPX&minPremium=250000` → CSV (für den DeepCharts-Indikator)
 - `GET /status` → Status je Ticker plus `generatedAt`
 - `GET /health` → `ok`

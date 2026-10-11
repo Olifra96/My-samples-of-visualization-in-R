@@ -40,12 +40,14 @@ public sealed class FlowStore
         return added;
     }
 
-    public List<FlowRecord> Snapshot(string? ticker = null, DateTimeOffset? since = null)
+    // minPremium: Datensätze ohne Premium-Angabe werden dabei ausgeschlossen (nicht als 0 gewertet).
+    public List<FlowRecord> Snapshot(string? ticker = null, DateTimeOffset? since = null, decimal? minPremium = null)
     {
         lock (_lock)
             return _items
                 .Where(r => ticker == null || r.DisplayTicker.Equals(ticker, StringComparison.OrdinalIgnoreCase))
                 .Where(r => since == null || r.TradeTime > since)
+                .Where(r => minPremium == null || r.Premium >= minPremium)
                 .ToList();
     }
 }
@@ -172,7 +174,7 @@ public sealed class FileSink
 }
 
 // Minimaler lokaler HTTP-Server (nur localhost):
-//   /flow[.csv]?ticker=NDX&since=<trade_time_ms>   /status   /health
+//   /flow[.csv]?ticker=SPX&since=<trade_time_ms>&minPremium=<USD>   /status   /health
 public sealed class HttpSink : IDisposable
 {
     private readonly HttpListener _listener = new();
@@ -210,15 +212,17 @@ public sealed class HttpSink : IDisposable
             var ticker = ctx.Request.QueryString["ticker"];
             DateTimeOffset? since = long.TryParse(ctx.Request.QueryString["since"], out var ms)
                 ? DateTimeOffset.FromUnixTimeMilliseconds(ms) : null;
+            decimal? minPremium = decimal.TryParse(ctx.Request.QueryString["minPremium"], NumberStyles.Number,
+                CultureInfo.InvariantCulture, out var mp) ? mp : null;
 
             switch (path)
             {
                 case "/flow":
-                    Respond(ctx, 200, "application/json", FlowFormat.ToJsonArray(_store.Snapshot(ticker, since)));
+                    Respond(ctx, 200, "application/json", FlowFormat.ToJsonArray(_store.Snapshot(ticker, since, minPremium)));
                     break;
                 case "/flow.csv":
                     var sb = new StringBuilder().AppendLine(FlowFormat.CsvHeader);
-                    foreach (var r in _store.Snapshot(ticker, since)) sb.AppendLine(FlowFormat.ToCsv(r));
+                    foreach (var r in _store.Snapshot(ticker, since, minPremium)) sb.AppendLine(FlowFormat.ToCsv(r));
                     Respond(ctx, 200, "text/csv", sb.ToString());
                     break;
                 case "/status":
